@@ -1,3 +1,102 @@
+# ESP32C3 W5500 Diepvries — project overzicht
+
+Korte beschrijving
+- Doel: een kleine, goed-gedocumenteerde template voor smart-home devices en loggers op basis van ESP32-C3 met W5500 Ethernet, WireGuard en I2C-peripherals (SSR, thermocouple, optionele power-meter).
+- Motivatie: bewijzen dat embedded projecten netjes en veilig gebouwd kunnen worden — geen rommelige architectuur of onnodige bugs.
+
+Belangrijkste punten
+- Schone C-code principes en modulair ontwerp (zie `docs/ARTICLE.md`).
+- Hardware: WS2812 status-LED, W5500 via SPI, meerdere I2C-devices (SSR, thermocouple, optioneel power meter).
+- Netwerk: W5500 Ethernet met WireGuard client voor veilige remote toegang.
+
+Mermaid architectuurdiagram
+
+```mermaid
+flowchart TD
+  subgraph ESP32
+    MCU[ESP32-C3 MCU]
+    I2C_BUS["I2C Bus (GPIO16/17)"]
+    SPI_BUS[SPI Bus]
+    LED["WS2812 LED (GPIO21)"]
+    WG[WireGuard Client]
+    APP[Application Task]
+  end
+
+  subgraph Peripherals
+    SSR["SSR (I2C)"]
+    THERMO["Thermocouple (I2C)"]
+    W5500["W5500 Ethernet (SPI)"]
+    PWRM["Power Meter (optional, I2C/SPI)"]
+  end
+
+  MCU -->|"SDA(GPIO16)/SCL(GPIO17)"| I2C_BUS
+  MCU -->|"MOSI(GPIO11)/MISO(GPIO12)/SCLK(GPIO13)/CS(GPIO14)"| SPI_BUS
+  I2C_BUS --> SSR
+  I2C_BUS --> THERMO
+  I2C_BUS --> PWRM
+  SPI_BUS --> W5500
+  MCU --> LED
+  APP --> MCU
+  APP --> WG
+  WG -->|tunnel| W5500
+
+  classDef hw fill:#f9f,stroke:#555,stroke-width:1px;
+  class SSR,THERMO,W5500,PWRM hw;
+```
+
+Pinout (actuele mappings)
+
+| Signaal | Device | ESP32 GPIO | Opmerkingen |
+|---|---:|---:|---|
+| WS2812 data | Status LED | GPIO21 | WS2812 (single-wire) |
+| I2C SDA | I2C bus | GPIO16 | Pull-ups 4.7k aanbevolen |
+| I2C SCL | I2C bus | GPIO17 | Pull-ups 4.7k aanbevolen |
+| I2C - SSR | SSR (I2C) | via I2C | I2C-adres: configureer in driver (placeholder 0xXX) |
+| I2C - Thermocouple | Thermocouple (I2C) | via I2C | I2C-adres: configureer in driver (placeholder 0xYY) |
+| SPI_MOSI | W5500 MOSI | GPIO11 | |
+| SPI_MISO | W5500 MISO | GPIO12 | |
+| SPI_SCLK | W5500 SCLK | GPIO13 | |
+| SPI_CS | W5500 CS | GPIO14 | |
+| ETH_INT | W5500 INT | GPIO10 | Interrupt lijn van W5500 naar MCU |
+| ETH_RST | W5500 RST | GPIO9 | Hardware reset voor W5500 |
+| Power meter (opt) | PWR sensor | (I2C/SPI/ADC) | afhankelijk module |
+
+
+https://docs.m5stack.com/en/unit/acssr
+
+### SSR (I2C slave)
+
+![M5 stack I2C SSR 10A AC](pdf_docs/ACSSR.jpg)
+
+**I2C-adres:** `0x50`
+
+| Register      | Access | Beschrijving            | Waarden / Opmerking        |
+|---------------|--------|-------------------------|----------------------------|
+| `0x00`        | R/W    | Power state             | `1 = ON`, `0 = OFF`        |
+| `0x20`        | R/W    | Slave address           | Nieuw I2C slave-adres      |
+| `0x10`-`0x12` | R/W    | RGB LED registers       | `0x10=R`, `0x11=G`, `0x12=B` |
+| `0xFE`        | R      | Version number          | Firmware/hardware versie   |
+
+### Thermocouple (I2C slave)
+
+![M5 stack I2C KMeterISO](pdf_docs/KMeterISO.jpg)
+
+
+Coding style & filosofie (kort)
+- Doelgroep: HBO embedded studenten — begrijpbaar en toepasbaar.
+- Korte functies, duidelijke namen, modulair: `.c` + `.h` per module.
+- Init/read/write API per module; fouten via enum return-codes.
+- Geen onnodige globals; gebruik configuratie-structs.
+- Loggen via centraal `log_printf(level, ...)`.
+- Non-blocking hoofdloop; timing via timers/RTOS tasks.
+- `const`-correctness, header guards, typedef-structs, enums voor errors.
+
+Quickstart
+1. Zorg dat je ESP-IDF toolchain geconfigureerd is (of je gebruikelijke build-flow).
+2. Build & flash zoals je normaal doet via `idf.py build flash` of je eigen script.
+3. Configureer WireGuard keys en voeg peer toe op je telefoon/remote.
+
+
 # ESP32-S3 standaard ESP-IDF project (CLI, Linux)
 
 Dit is een **minimaal ESP-IDF** project (zonder PlatformIO) voor:
