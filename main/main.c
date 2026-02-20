@@ -21,6 +21,7 @@
 #include "esp_timer.h"
 #include "led_strip.h"
 #include "ssr_control.h"
+#include "th_sensor.h"
 
 static const char* g_log_tag = "app_main";
 
@@ -422,8 +423,12 @@ void app_main(void)
 
     app_i2c_scan_and_report();
 
-    ssr_t ssr;
+    ssr_t ssr = { 0 };
+    th_t th = { 0 };
+
     ssr_result_t r = ssr_init(&ssr, g_i2c_bus, 0x50, 200);
+    th_result_t th_r = th_init(&th, g_i2c_bus, 0x66, 200);
+
     if (r.tag != SSR_STATUS_OK) {
         if (r.tag == SSR_STATUS_I2C_ERR) {
             ESP_LOGE(g_log_tag, "ssr_init failed: tag=%d err=%s", (int)r.tag,
@@ -451,6 +456,34 @@ void app_main(void)
             ESP_LOGW(g_log_tag, "ssr_get_version err tag=%d", (int)r.tag);
         }
         while (true) {
+
+            th_r = th_get_temp_c(&th); // get float using string read + conversion
+
+            if (th_r.tag == TH_STATUS_OK) {
+                ESP_LOGI(g_log_tag, "sth temp=%f C", th_r.value.temp_c);
+            } else if (th_r.tag == TH_STATUS_I2C_ERR) {
+                ESP_LOGW(
+                    g_log_tag, "sth_get_temp_c i2c err=%s", esp_err_to_name(th_r.value.esp_code));
+            } else if (th_r.tag == TH_STATUS_SENSOR_ERR) {
+                ESP_LOGW(
+                    g_log_tag, "sth_get_temp_c sensor error, status=0x%08X", th_r.value.status);
+            } else {
+                ESP_LOGW(g_log_tag, "sth_get_temp_c err tag=%d", (int)th_r.tag);
+            }
+
+            th_r = th_get_temp_c_float(&th); // get float using direct raw read
+
+            if (th_r.tag == TH_STATUS_OK) {
+                ESP_LOGI(g_log_tag, "th tempf=%f C", th_r.value.temp_c);
+            } else if (th_r.tag == TH_STATUS_I2C_ERR) {
+                ESP_LOGW(
+                    g_log_tag, "th_get_temp_c i2c err=%s", esp_err_to_name(th_r.value.esp_code));
+            } else if (th_r.tag == TH_STATUS_SENSOR_ERR) {
+                ESP_LOGW(g_log_tag, "th_get_temp_c sensor error, status=0x%08X", th_r.value.status);
+            } else {
+                ESP_LOGW(g_log_tag, "th_get_temp_c err tag=%d", (int)th_r.tag);
+            }
+
             r = ssr_get_active(&ssr);
             if (r.tag == SSR_STATUS_OK) {
                 ESP_LOGI(g_log_tag, "ssr active=%s", r.value.active ? "true" : "false");

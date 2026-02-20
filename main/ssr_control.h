@@ -70,13 +70,6 @@ typedef struct ssr_result_s {
 } ssr_result_t;
 
 /**
- * Initialize an `ssr_t` object. Returns a tagged result.
- * @param self Pointer to user-allocated ssr_t object
- * @param i2c_num I2C port (I2C_NUM_0 / I2C_NUM_1)
- * @param i2c_addr 7-bit I2C device address (e.g. 0x50)
- * @param timeout_ms transaction timeout in milliseconds
- */
-/**
  * @brief Initialize an `ssr_t` instance.
  *
  * This will create a device handle on the provided `i2c_bus` for `i2c_addr`.
@@ -97,7 +90,7 @@ ssr_result_t ssr_init(ssr_t *self, i2c_master_bus_handle_t i2c_bus, uint8_t i2c_
  * @brief Deinitialize an `ssr_t` instance and release any device handles.
  *
  * Safe to call on partially initialized objects. After this call the
- * `self` contents are cleared.
+ * `self` contents are cleared. pointer is also set to NULL to prevent use-after-free if the caller tries to reuse the
  */
 ssr_result_t ssr_deinit(ssr_t *self);
 

@@ -11,9 +11,7 @@
  * @brief Read a single register from the SSR device.
  *
  * On success the returned `ssr_result_t` has `tag == SSR_STATUS_OK` and the
- * read byte is placed in `value.version`. If a device-handle (`self->dev`)
- * is present the device-based API is used; otherwise the bus/address variant
- * is used as a fallback.
+ * read byte is placed in `value.version`. 
  */
 static ssr_result_t read_reg(ssr_t *self, uint8_t reg)
 {
@@ -44,8 +42,7 @@ static ssr_result_t read_reg(ssr_t *self, uint8_t reg)
  * @internal
  * @brief Write a single byte to an SSR register.
  *
- * Uses the device-handle API when available, otherwise falls back to the
- * bus/address transmit API.
+ * Uses the device-handle API
  */
 static ssr_result_t write_reg(ssr_t *self, uint8_t reg, uint8_t val)
 {
@@ -100,7 +97,7 @@ ssr_result_t ssr_init(ssr_t *self, i2c_master_bus_handle_t i2c_bus, uint8_t i2c_
 ssr_result_t ssr_deinit(ssr_t *self)
 {
     ssr_result_t res = { .tag = SSR_STATUS_OK, .value.reserved = 0 };
-    if (!self) {
+    if (!self ) {
         res.tag = SSR_STATUS_ARG_ERR;
         return res;
     }
