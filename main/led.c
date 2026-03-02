@@ -1,11 +1,11 @@
 #include "led.h"
-#include "esp_log.h"
 #include "esp_event.h"
+#include "esp_log.h"
 #include "esp_timer.h"
-#include "led_strip.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "freertos/portmacro.h"
+#include "freertos/task.h"
+#include "led_strip.h"
 
 #include <string.h>
 
@@ -83,19 +83,25 @@ static void led_timer_cb(void *arg) {
     led_strip_refresh(s_led_strip);
 }
 
-static void led_event_handler(void *handler_arg, esp_event_base_t base, int32_t id, void *event_data) {
-    (void)handler_arg; (void)base;
+static void led_event_handler(void *handler_arg, esp_event_base_t base, int32_t id,
+                              void *event_data) {
+    (void)handler_arg;
+    (void)base;
     if (id == LED_EVENT_SET_COLOR && event_data) {
         led_color_payload_t *p = (led_color_payload_t *)event_data;
         portENTER_CRITICAL(&s_led_mux);
-        s_led_r = p->r; s_led_g = p->g; s_led_b = p->b;
+        s_led_r = p->r;
+        s_led_g = p->g;
+        s_led_b = p->b;
         s_led_override = true;
         portEXIT_CRITICAL(&s_led_mux);
     } else if (id == LED_EVENT_TEMP_ALARM && event_data) {
         bool alarm = *(bool *)event_data;
         portENTER_CRITICAL(&s_led_mux);
         if (alarm) {
-            s_led_r = 0xFF; s_led_g = 0x00; s_led_b = 0x00;
+            s_led_r = 0xFF;
+            s_led_g = 0x00;
+            s_led_b = 0x00;
             s_led_override = true;
         } else {
             s_led_override = false;
@@ -104,8 +110,17 @@ static void led_event_handler(void *handler_arg, esp_event_base_t base, int32_t 
     } else if (id == LED_EVENT_WG_STATUS && event_data) {
         int st = *(int *)event_data;
         portENTER_CRITICAL(&s_led_mux);
-        if (st) { s_led_r = 0x00; s_led_g = 0x00; s_led_b = 0x80; s_led_override = true; }
-        else    { s_led_r = 0x80; s_led_g = 0x00; s_led_b = 0x00; s_led_override = true; }
+        if (st) {
+            s_led_r = 0x00;
+            s_led_g = 0x00;
+            s_led_b = 0x80;
+            s_led_override = true;
+        } else {
+            s_led_r = 0x80;
+            s_led_g = 0x00;
+            s_led_b = 0x00;
+            s_led_override = true;
+        }
         portEXIT_CRITICAL(&s_led_mux);
     }
 }
@@ -166,9 +181,11 @@ esp_err_t led_post_color(uint8_t r, uint8_t g, uint8_t b) {
 }
 
 esp_err_t led_post_temp_alarm(bool alarm) {
-    return esp_event_post(LED_EVENT_BASE, LED_EVENT_TEMP_ALARM, &alarm, sizeof(alarm), portMAX_DELAY);
+    return esp_event_post(LED_EVENT_BASE, LED_EVENT_TEMP_ALARM, &alarm, sizeof(alarm),
+                          portMAX_DELAY);
 }
 
 esp_err_t led_post_wg_status(int status) {
-    return esp_event_post(LED_EVENT_BASE, LED_EVENT_WG_STATUS, &status, sizeof(status), portMAX_DELAY);
+    return esp_event_post(LED_EVENT_BASE, LED_EVENT_WG_STATUS, &status, sizeof(status),
+                          portMAX_DELAY);
 }

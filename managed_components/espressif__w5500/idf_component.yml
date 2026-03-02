@@ -1,5 +1,5 @@
 dependencies:
-  idf: '>=6.0'
+  idf: '>=5.0'
 description: W5500 Ethernet Driver
 repository: git://github.com/espressif/esp-eth-drivers.git
 repository_info:
