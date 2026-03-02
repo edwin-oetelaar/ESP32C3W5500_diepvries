@@ -1,0 +1,15 @@
+---
+BasedOnStyle: LLVM
+# Layout regels
+ColumnLimit: 100
+IndentWidth: 4
+UseTab: Never
+
+# Accolade regels (NIET op een nieuwe regel)
+BreakBeforeBraces: Attach
+AllowShortBlocksOnASingleLine: false
+AllowShortFunctionsOnASingleLine: None
+
+# Extra netheid voor C
+AlignAfterOpenBracket: Align
+---

@@ -11,8 +11,7 @@
  * Returns true on success and writes value into *out.
  * Returns false for malformed input.
  */
-bool temp_str_to_float(const char* s, float* out)
-{
+bool temp_str_to_float(const char *s, float *out) {
     if (!s || !out)
         return false;
 
@@ -41,7 +40,7 @@ bool temp_str_to_float(const char* s, float* out)
     if (*s == '.') {
         s++;
         while (*s >= '0' && *s <= '9') {
-            frac = frac * 10.0f + (float)(*s - '0');
+            frac = frac * 10.0f + (float) (*s - '0');
             div *= 10.0f;
             s++;
             frac_digits++;
@@ -60,14 +59,13 @@ bool temp_str_to_float(const char* s, float* out)
     if (*s != '\0')
         return false;
 
-    *out = sign * ((float)int_part + (frac_digits ? (frac / div) : 0.0f));
+    *out = sign * ((float) int_part + (frac_digits ? (frac / div) : 0.0f));
     return true;
 }
 
 /* Internal helper: read multiple bytes starting at `reg` */
-static th_result_t read_regs(th_t* self, uint8_t reg, uint8_t* out, size_t len)
-{
-    th_result_t res = { .tag = TH_STATUS_OK };
+static th_result_t read_regs(th_t *self, uint8_t reg, uint8_t *out, size_t len) {
+    th_result_t res = {.tag = TH_STATUS_OK};
     if (!self || !self->initialized || out == NULL || len == 0) {
         res.tag = TH_STATUS_ARG_ERR;
         return res;
@@ -112,10 +110,8 @@ static th_result_t read_regs(th_t* self, uint8_t reg, uint8_t* out, size_t len)
 //     return res;
 // }
 
-th_result_t th_init(
-    th_t* self, i2c_master_bus_handle_t i2c_bus, uint8_t i2c_addr, uint32_t timeout_ms)
-{
-    th_result_t res = { .tag = TH_STATUS_OK };
+th_result_t th_init(th_t *self, i2c_master_bus_handle_t i2c_bus, uint8_t i2c_addr, uint32_t timeout_ms) {
+    th_result_t res = {.tag = TH_STATUS_OK};
     if (!self || i2c_addr == 0) {
         res.tag = TH_STATUS_ARG_ERR;
         return res;
@@ -142,9 +138,8 @@ th_result_t th_init(
     return res;
 }
 
-th_result_t th_deinit(th_t* self)
-{
-    th_result_t res = { .tag = TH_STATUS_OK };
+th_result_t th_deinit(th_t *self) {
+    th_result_t res = {.tag = TH_STATUS_OK};
     if (!self) {
         res.tag = TH_STATUS_ARG_ERR;
         return res;
@@ -157,52 +152,79 @@ th_result_t th_deinit(th_t* self)
     return res;
 }
 
-th_result_t th_get_temp_c_str(th_t* self)
-{
-    th_result_t res = { .tag = TH_STATUS_OK };
-    uint8_t buf[8] = { 0 };
-    th_result_t r = read_regs(self, KMETER_TEMP_CELSIUS_STRING_REG, buf, sizeof(buf));
-    if (r.tag != TH_STATUS_OK)
-        return r;
-
-    res.tag = TH_STATUS_OK;
-    memcpy(res.value.str_c, buf, sizeof(res.value.str_c));
-    return res;
-}
-
-th_result_t th_get_temp_c(th_t* self)
-{ /* read temp from sensor string representation (8 bytes) into float using conversion */
-    th_result_t res = { .tag = TH_STATUS_OK };
-    uint8_t buf[9] = { 0 };
-    th_result_t r = read_regs(self, KMETER_TEMP_CELSIUS_STRING_REG, buf,
-        sizeof(buf) - 1); /* read 8 bytes + null terminator */
-    if (r.tag != TH_STATUS_OK)
-        return r;
-
-    // convert string to float
-    float temp_c = 0.0f;
-    if (!temp_str_to_float((char*)buf, &temp_c)) {
-        res.tag = TH_STATUS_SENSOR_ERR;
+/* Universal getter implementation. Returns different union fields depending
+ * on `param`. This centralizes reads and keeps backwards-compatible wrappers
+ * thin.
+ */
+th_result_t th_get(th_t *self, th_get_param_t param) {
+    th_result_t res = {.tag = TH_STATUS_OK};
+    if (!self || !self->initialized) {
+        res.tag = TH_STATUS_ARG_ERR;
         return res;
     }
 
-    res.tag = TH_STATUS_OK;
-    res.value.temp_c = temp_c;
-
-    return res;
+    switch (param) {
+    case TH_GET_PARAM_TEMP_STR_C: {
+        uint8_t buf[8] = {0};
+        th_result_t r = read_regs(self, KMETER_TEMP_CELSIUS_STRING_REG, buf, sizeof(buf));
+        if (r.tag != TH_STATUS_OK)
+            return r;
+        memcpy(res.value.str_c, buf, sizeof(res.value.str_c));
+        return res;
+    }
+    case TH_GET_PARAM_TEMP_C: {
+        uint8_t buf[9] = {0};
+        th_result_t r = read_regs(self, KMETER_TEMP_CELSIUS_STRING_REG, buf, sizeof(buf) - 1);
+        if (r.tag != TH_STATUS_OK)
+            return r;
+        float temp_c = 0.0f;
+        if (!temp_str_to_float((char *)buf, &temp_c)) {
+            res.tag = TH_STATUS_SENSOR_ERR;
+            return res;
+        }
+        res.value.temp_c = temp_c;
+        return res;
+    }
+    case TH_GET_PARAM_TEMP_RAW: {
+        int32_t raw = 0;
+        th_result_t r = read_regs(self, KMETER_TEMP_VAL_REG, (uint8_t *)&raw, 4);
+        if (r.tag != TH_STATUS_OK)
+            return r;
+        res.value.temp_c = ((float)raw) / 100.0f;
+        return res;
+    }
+    case TH_GET_PARAM_VERSION: {
+        uint8_t v = 0;
+        th_result_t r = read_regs(self, KMETER_FIRMWARE_VERSION_REG, &v, 1);
+        if (r.tag != TH_STATUS_OK)
+            return r;
+        res.value.version = v;
+        return res;
+    }
+    case TH_GET_PARAM_STATUS: {
+        uint32_t st = 0;
+        th_result_t r = read_regs(self, KMETER_KMETER_ERROR_STATUS_REG, (uint8_t *)&st, 4);
+        if (r.tag != TH_STATUS_OK)
+            return r;
+        res.value.status = st;
+        return res;
+    }
+    default:
+        res.tag = TH_STATUS_ARG_ERR;
+        return res;
+    }
 }
 
-th_result_t th_get_temp_c_float(th_t* self)
-{ /* read temp directly from sensor without string converstion, int to float */
-    th_result_t res = { .tag = TH_STATUS_OK };
-    int32_t buf = { 0 };
-    th_result_t r = read_regs(self, KMETER_TEMP_VAL_REG, (uint8_t*)&buf, 4); /* read 4 bytes */
-    if (r.tag != TH_STATUS_OK)
-        return r;
+th_result_t th_get_temp_c_str(th_t *self) {
+    return th_get(self, TH_GET_PARAM_TEMP_STR_C);
+}
 
-    float temp = ((float)buf) / 100.0f; /* bytes are signed int 0.01 deg C, convert to float */
+th_result_t th_get_temp_c(th_t *self) {
+    /* read temp from sensor string representation (8 bytes) into float using conversion */
+    return th_get(self, TH_GET_PARAM_TEMP_C);
+}
 
-    res.tag = TH_STATUS_OK;
-    res.value.temp_c = temp;
-    return res;
+th_result_t th_get_temp_c_float(th_t *self) {
+    /* read temp directly from sensor without string converstion, int to float */
+    return th_get(self, TH_GET_PARAM_TEMP_RAW);
 }

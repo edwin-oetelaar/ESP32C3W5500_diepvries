@@ -19,7 +19,7 @@
 #define KMETER_DEFAULT_ADDR                        0x66 /* 1 byte */
 #define KMETER_TEMP_VAL_REG                        0x00 /* 4 bytes: float */
 #define KMETER_INTERNAL_TEMP_VAL_REG               0x10 /* 4 bytes */
-#define KMETER_KMETER_ERROR_STATUS_REG             0x20 
+#define KMETER_KMETER_ERROR_STATUS_REG             0x20
 #define KMETER_TEMP_CELSIUS_STRING_REG             0x30 /* 8 bytes */
 #define KMETER_TEMP_FAHRENHEIT_STRING_REG          0x40 /* 8 bytes */
 #define KMETER_INTERNAL_TEMP_CELSIUS_STRING_REG    0x50 /* 8 bytes */
@@ -42,7 +42,7 @@ typedef enum th_status_tag_e {
 typedef struct th_t {
     i2c_master_bus_handle_t i2c_bus;
     i2c_master_dev_handle_t dev; /**< device handle created on init (may be NULL) */
-    uint8_t i2c_addr;    /**< 7-bit I2C address */
+    uint8_t i2c_addr; /**< 7-bit I2C address */
     uint32_t timeout_ms; /**< transaction timeout */
     bool initialized;
 } th_t;
@@ -52,14 +52,34 @@ typedef struct th_t {
  */
 typedef struct th_result_s {
     th_status_tag_t tag;
+
     union {
         esp_err_t esp_code; /**< underlying esp_err when i2c fails */
-        float temp_c;       /**< returned by `th_get_temp_c` on success */
-        char str_c[8];      /**< string buffer for string results */
-        uint8_t version;    /**< returned by `th_get_version` */
-        uint32_t status;    /**< device status code */
+        float temp_c; /**< returned by `th_get_temp_c` on success */
+        char str_c[8]; /**< string buffer for string results */
+        uint8_t version; /**< returned by `th_get_version` */
+        uint32_t status; /**< device status code */
     } value;
 } th_result_t;
+
+/**
+ * @brief Parameters for the universal `th_get()` accessor.
+ */
+typedef enum th_get_param_e {
+    TH_GET_PARAM_TEMP_C,      /* converted Celsius (float) from string */
+    TH_GET_PARAM_TEMP_RAW,    /* raw integer sensor value (0.01 deg C -> converted to float) */
+    TH_GET_PARAM_TEMP_STR_C,  /* Celsius as 8-byte string */
+    TH_GET_PARAM_VERSION,     /* firmware version (uint8_t) */
+    TH_GET_PARAM_STATUS,      /* device status (uint32_t) */
+} th_get_param_t;
+
+/**
+ * @brief Universal getter for sensor properties.
+ *
+ * Use `th_get_param_t` to request the desired value. Returned value will be
+ * placed in the appropriate field of the `th_result_t` union.
+ */
+th_result_t th_get(th_t *self, th_get_param_t param);
 
 /**
  * @brief Initialize a `th_t` instance and create a device handle on the bus.
@@ -90,8 +110,9 @@ th_result_t th_get_temp_c_str(th_t *self);
 
 /* read temp as float */
 
-th_result_t th_get_temp_c(th_t *self); // read string data and convert to float
-th_result_t th_get_temp_c_float(th_t *self); // read raw data from registers and convert to float
+/* Backwards-compatible wrappers (now call `th_get`). Prefer `th_get()` */
+th_result_t th_get_temp_c(th_t *self); // read string data and convert to float (deprecated)
+th_result_t th_get_temp_c_float(th_t *self); // read raw data from registers and convert to float (deprecated)
 
 /**
  * @brief Read device version (register 0xFE assumed).

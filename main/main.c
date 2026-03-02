@@ -10,8 +10,8 @@
 #include "esp_check.h"
 #include "esp_err.h"
 #include "esp_eth.h"
-#include "esp_eth_mac_w5500.h"
-#include "esp_eth_phy_w5500.h"
+// #include "esp_eth_mac_w5500.h"
+// #include "esp_eth_phy_w5500.h"
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_mac.h"
@@ -20,10 +20,13 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "led_strip.h"
+#include "nvs_flash.h"
 #include "ssr_control.h"
 #include "th_sensor.h"
+#include "wg_obj.h"
+#include "wifi.h"
 
-static const char* g_log_tag = "app_main";
+static const char *g_log_tag = "app_main";
 
 /* Pas deze GPIO's aan op jouw S3 board routing naar W5500. */
 static const gpio_num_t g_pin_led = GPIO_NUM_21; /* WS2812 data pin */
@@ -42,25 +45,92 @@ static const uint32_t g_i2c_clk_hz = 400000;
 
 static const int g_i2c_probe_timeout_ms = 20;
 
-static const int g_led_period_us = 500 * 1000; /* LED blink period in microseconds */
+static const int g_led_period_us = 100 * 1000; /* LED blink period in microseconds (10Hz) */
 static esp_eth_handle_t g_eth_handle = NULL;
 
 static bool g_led_state = false;
 static esp_timer_handle_t g_led_timer = NULL;
 
+/* LED state updated from event handler */
+static bool g_led_override = false;
+static uint8_t g_led_r = 0, g_led_g = 0, g_led_b = 0;
+
+/* Application event base for internal pub-sub */
+ESP_EVENT_DEFINE_BASE(APP_EVENT);
+
+enum {
+    APP_EVENT_LED_SET_COLOR = 0,
+    APP_EVENT_TEMP_ALARM,
+    APP_EVENT_WG_STATUS,
+};
+
+typedef struct {
+    uint8_t r, g, b;
+} app_led_color_t;
+
+static void app_event_handler(void *handler_arg, esp_event_base_t base, int32_t id, void *event_data) {
+    (void)handler_arg;
+    if (base != APP_EVENT)
+        return;
+
+    if (id == APP_EVENT_LED_SET_COLOR && event_data) {
+        app_led_color_t *c = (app_led_color_t *)event_data;
+        g_led_r = c->r;
+        g_led_g = c->g;
+        g_led_b = c->b;
+        g_led_override = true;
+    } else if (id == APP_EVENT_TEMP_ALARM && event_data) {
+        /* event_data is bool pointer: true => alarm */
+        bool alarm = *(bool *)event_data;
+        if (alarm) {
+            /* red for temp alarm */
+            g_led_r = 0xFF; g_led_g = 0x00; g_led_b = 0x00;
+            g_led_override = true;
+        } else {
+            /* clear override to resume normal blink */
+            g_led_override = false;
+        }
+    } else if (id == APP_EVENT_WG_STATUS && event_data) {
+        /* event_data is int: 0=down,1=up */
+        int st = *(int *)event_data;
+        if (st) {
+            /* blue when WG up */
+            g_led_r = 0x00; g_led_g = 0x00; g_led_b = 0x80;
+            g_led_override = true;
+        } else {
+            /* red when WG down */
+            g_led_r = 0x80; g_led_g = 0x00; g_led_b = 0x00;
+            g_led_override = true;
+        }
+    }
+}
+
+static esp_err_t app_post_led_color(uint8_t r, uint8_t g, uint8_t b) {
+    app_led_color_t c = {.r = r, .g = g, .b = b};
+    return esp_event_post(APP_EVENT, APP_EVENT_LED_SET_COLOR, &c, sizeof(c), portMAX_DELAY);
+}
+
+static esp_err_t app_post_temp_alarm(bool alarm) {
+    return esp_event_post(APP_EVENT, APP_EVENT_TEMP_ALARM, &alarm, sizeof(alarm), portMAX_DELAY);
+}
+
+static esp_err_t app_post_wg_status(int status) {
+    return esp_event_post(APP_EVENT, APP_EVENT_WG_STATUS, &status, sizeof(status), portMAX_DELAY);
+}
+
 static i2c_master_bus_handle_t g_i2c_bus = NULL;
 
 static led_strip_handle_t led_strip = NULL;
+static wg_t *wg = NULL;
 
-led_strip_handle_t configure_led(void)
-{
+led_strip_handle_t configure_led(void) {
     /* LED strip common configuration */
     led_strip_config_t strip_config = {
         .strip_gpio_num = g_pin_led,
         .max_leds = 1,
         .led_model = LED_MODEL_WS2812,
         .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags = { .invert_out = false },
+        .flags = {.invert_out = false},
     };
 
     /* RMT backend specific configuration */
@@ -68,7 +138,7 @@ led_strip_handle_t configure_led(void)
         .clk_src = RMT_CLK_SRC_DEFAULT,
         .resolution_hz = 10 * 1000 * 1000, /* 10MHz */
         .mem_block_symbols = 64,
-        .flags = { .with_dma = false },
+        .flags = {.with_dma = false},
     };
 
     /* Create the LED strip object and store it in the global handle */
@@ -112,26 +182,27 @@ static const uint8_t g_i2c_expected_ids[] = {
 };
 
 /* Forward declaration of IP event handler used during netif setup */
-static void got_ip_event_handler(
-    void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data);
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
+                                 void *event_data);
 
-static app_status_t app_init_eth_w5500(void)
-{
+static void
+maybe_start_wireguard(void); /* Forward declaration of shared WireGuard startup helper */
+
+static app_status_t app_init_eth_w5500(void) {
     esp_err_t rc = esp_netif_init();
     if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-        return (app_status_t) { .tag = APP_STATUS_NETIF_INIT_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_NETIF_INIT_ERR, .value = {.esp_code = rc}};
     }
 
     rc = esp_event_loop_create_default();
     if (rc != ESP_OK && rc != ESP_ERR_INVALID_STATE) {
-        return (app_status_t) { .tag = APP_STATUS_EVENT_LOOP_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_EVENT_LOOP_ERR, .value = {.esp_code = rc}};
     }
 
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
-    esp_netif_t* netif = esp_netif_new(&netif_cfg);
+    esp_netif_t *netif = esp_netif_new(&netif_cfg);
     if (netif == NULL) {
-        return (
-            app_status_t) { .tag = APP_STATUS_NETIF_INIT_ERR, .value = { .esp_code = ESP_FAIL } };
+        return (app_status_t){.tag = APP_STATUS_NETIF_INIT_ERR, .value = {.esp_code = ESP_FAIL}};
     }
 
     const spi_bus_config_t spi_bus_cfg = {
@@ -152,7 +223,7 @@ static app_status_t app_init_eth_w5500(void)
 
     rc = spi_bus_initialize(SPI2_HOST, &spi_bus_cfg, SPI_DMA_CH_AUTO);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_SPI_BUS_INIT_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_SPI_BUS_INIT_ERR, .value = {.esp_code = rc}};
     }
 
     spi_device_interface_config_t dev_cfg = {
@@ -168,45 +239,44 @@ static app_status_t app_init_eth_w5500(void)
     w5500_cfg.int_gpio_num = g_pin_eth_int;
 
     eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
-    esp_eth_mac_t* mac = esp_eth_mac_new_w5500(&w5500_cfg, &mac_cfg);
+    esp_eth_mac_t *mac = esp_eth_mac_new_w5500(&w5500_cfg, &mac_cfg);
     if (mac == NULL) {
-        return (app_status_t) { .tag = APP_STATUS_ETH_MAC_ERR, .value = { .esp_code = ESP_FAIL } };
+        return (app_status_t){.tag = APP_STATUS_ETH_MAC_ERR, .value = {.esp_code = ESP_FAIL}};
     }
 
     eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
     phy_cfg.reset_gpio_num = g_pin_eth_rst;
     phy_cfg.autonego_timeout_ms = 0;
-    esp_eth_phy_t* phy = esp_eth_phy_new_w5500(&phy_cfg);
+    esp_eth_phy_t *phy = esp_eth_phy_new_w5500(&phy_cfg);
     if (phy == NULL) {
-        return (app_status_t) { .tag = APP_STATUS_ETH_PHY_ERR, .value = { .esp_code = ESP_FAIL } };
+        return (app_status_t){.tag = APP_STATUS_ETH_PHY_ERR, .value = {.esp_code = ESP_FAIL}};
     }
 
     esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
     rc = esp_eth_driver_install(&eth_cfg, &g_eth_handle);
     if (rc != ESP_OK) {
-        return (
-            app_status_t) { .tag = APP_STATUS_ETH_DRV_INSTALL_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_ETH_DRV_INSTALL_ERR, .value = {.esp_code = rc}};
     }
 
     /* Ensure the MAC address is set on the MAC and the netif before
      * attaching. */
-    uint8_t mac_addr[6] = { 0 };
+    uint8_t mac_addr[6] = {0};
     if (esp_read_mac(mac_addr, ESP_MAC_ETH) == ESP_OK) {
         ESP_LOGI(g_log_tag, "Using base MAC from efuse: %02x:%02x:%02x:%02x:%02x:%02x", mac_addr[0],
-            mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+                 mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
     } else {
         /* Fallback: generate a random MAC (locally administered) */
         esp_fill_random(mac_addr, sizeof(mac_addr));
         mac_addr[0] = (mac_addr[0] & 0xFE) | 0x02; // locally administered
         ESP_LOGW(g_log_tag, "Using generated MAC: %02x:%02x:%02x:%02x:%02x:%02x", mac_addr[0],
-            mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
+                 mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5]);
     }
 
     /* Set MAC on the driver */
     esp_err_t ioctl_rc = esp_eth_ioctl(g_eth_handle, ETH_CMD_S_MAC_ADDR, mac_addr);
     if (ioctl_rc != ESP_OK) {
-        ESP_LOGW(
-            g_log_tag, "esp_eth_ioctl(ETH_CMD_S_MAC_ADDR) returned %s", esp_err_to_name(ioctl_rc));
+        ESP_LOGW(g_log_tag, "esp_eth_ioctl(ETH_CMD_S_MAC_ADDR) returned %s",
+                 esp_err_to_name(ioctl_rc));
     }
 
     /* Also set MAC on esp-netif so it shows up in netif glue */
@@ -217,32 +287,31 @@ static app_status_t app_init_eth_w5500(void)
 
     rc = esp_netif_attach(netif, esp_eth_new_netif_glue(g_eth_handle));
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_ETH_ATTACH_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_ETH_ATTACH_ERR, .value = {.esp_code = rc}};
     }
 
     /* Register IP event handler and start DHCP client on the ethernet
      * interface */
     rc = esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, netif);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_EVENT_LOOP_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_EVENT_LOOP_ERR, .value = {.esp_code = rc}};
     }
 
     rc = esp_netif_dhcpc_start(netif);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_NETIF_INIT_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_NETIF_INIT_ERR, .value = {.esp_code = rc}};
     }
 
     rc = esp_eth_start(g_eth_handle);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_ETH_START_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_ETH_START_ERR, .value = {.esp_code = rc}};
     }
 
-    return (app_status_t) { .tag = APP_STATUS_OK, .value = { .reserved = 0 } };
+    return (app_status_t){.tag = APP_STATUS_OK, .value = {.reserved = 0}};
 }
 
-static void got_ip_event_handler(
-    void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data)
-{
+static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
+                                 void *event_data) {
     (void)event_base;
     (void)event_id;
     // esp_netif_t *netif = (esp_netif_t *)arg;
@@ -250,28 +319,92 @@ static void got_ip_event_handler(
         return;
     }
 
-    ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
+    ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
     esp_netif_ip_info_t ip_info = event->ip_info;
     ESP_LOGI(g_log_tag, "Ethernet got IP: " IPSTR, IP2STR(&ip_info.ip));
 
     /* Optionally, stop DHCP if you want to switch to static later:
      * esp_netif_dhcpc_stop(netif);
      */
+
+    /* Start WireGuard if configured (shared helper) */
+    extern void maybe_start_wireguard(void);
+    maybe_start_wireguard();
 }
 
-static void app_log_status(const char* label, app_status_t status)
-{
+/* Helper used by both ethernet IP handler and WiFi callback */
+static void maybe_start_wireguard(void) {
+    /* WIRE GUARD needs STA interface to connect, modify wireguardif.c to fix this */
+    /* Example WireGuard startup: replace with your base64 keys and endpoint.
+     * - WG_PRIV_B64 and WG_PEER_B64 are required.
+     * - WG_PSK_B64 is optional (pre-shared key).
+     */
+#ifndef WG_PRIV_B64
+#define WG_PRIV_B64 "SIxMY6O6WcA2I034xXEZUZiShZTZkAcLzJ+uAYO1x18="
+#define WG_PEER_B64 "/09qsI3rB3N+nJHQGCHB4Yvc4sL8i18ZNkKVO2PkFUw="
+#define WG_PSK_B64 "hqWEjSRslhmoL0EOZ7A9fFTuphtTEDCZnscukE1/nFI="
+#define WG_PEER_ENDPOINT "l18l.nl"
+#define WG_ALLOWED_IPS "10.77.76.33" /* geen netmask, enkel 1 IP, dus /32 */
+#endif
+    /* Migrate to object-style WireGuard API */
+    if (wg != NULL) {
+        ESP_LOGI(g_log_tag, "wireguard already initialised");
+        return;
+    }
+    wg = wg_new();
+
+    if (!wg) {
+        ESP_LOGW(g_log_tag, "wg_new failed: no memory");
+    } else {
+        if (wg_set_local_keys(wg, WG_PRIV_B64, WG_PEER_B64, WG_PSK_B64) != WG_OK) {
+            ESP_LOGW(g_log_tag, "wg_set_local_keys failed");
+            wg_destroy(&wg);
+        } else {
+            wg_peer_cfg_t peer = {0};
+            peer.peer_pub_b64 = WG_PEER_B64;
+            peer.preshared_b64 = WG_PSK_B64;
+            peer.endpoint = WG_PEER_ENDPOINT;
+            peer.allowed_ips = WG_ALLOWED_IPS;
+            peer.keepalive_seconds = 30;
+            peer.port = 51820;
+
+            if (wg_add_peer(wg, &peer) != WG_OK) {
+                ESP_LOGW(g_log_tag, "wg_add_peer failed");
+                wg_destroy(&wg);
+            } else if (wg_start(wg) != WG_OK) {
+                ESP_LOGW(g_log_tag, "wg_start failed");
+                app_post_wg_status(0);
+                wg_destroy(&wg);
+            } else if (wg_connect_peer(wg, WG_PEER_B64) != WG_OK) {
+                ESP_LOGW(g_log_tag, "wg_connect_peer failed");
+                /* keep wg object around in case caller wants to inspect */
+                app_post_wg_status(0);
+            } else {
+                app_post_wg_status(1);
+                ESP_LOGI(g_log_tag, "wireguard init via object API succeeded");
+            }
+        }
+    }
+}
+
+/* Callback invoked by WiFi module when STA gets IP */
+static void wifi_got_ip_cb(void *arg) {
+    (void)arg;
+    ESP_LOGI(g_log_tag, "WiFi STA got IP, checking if WireGuard should start...");
+    maybe_start_wireguard();
+}
+
+static void app_log_status(const char *label, app_status_t status) {
     if (status.tag == APP_STATUS_OK) {
         ESP_LOGI(g_log_tag, "%s: ok", label);
         return;
     }
 
     ESP_LOGE(g_log_tag, "%s: failed (tag=%d, err=%s)", label, (int)status.tag,
-        esp_err_to_name(status.value.esp_code));
+             esp_err_to_name(status.value.esp_code));
 }
 
-static app_status_t app_init_i2c(void)
-{
+static app_status_t app_init_i2c(void) {
     const i2c_master_bus_config_t cfg = {
         .i2c_port = g_i2c_port,
         .sda_io_num = g_pin_i2c_sda,
@@ -285,14 +418,13 @@ static app_status_t app_init_i2c(void)
 
     const esp_err_t rc = i2c_new_master_bus(&cfg, &g_i2c_bus);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_I2C_BUS_NEW_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_I2C_BUS_NEW_ERR, .value = {.esp_code = rc}};
     }
 
-    return (app_status_t) { .tag = APP_STATUS_OK, .value = { .reserved = 0 } };
+    return (app_status_t){.tag = APP_STATUS_OK, .value = {.reserved = 0}};
 }
 
-static bool app_i2c_probe_addr(uint8_t addr)
-{
+static bool app_i2c_probe_addr(uint8_t addr) {
     if (g_i2c_bus == NULL) {
         return false;
     }
@@ -301,8 +433,7 @@ static bool app_i2c_probe_addr(uint8_t addr)
     return rc == ESP_OK;
 }
 
-static bool app_i2c_contains_u8(const uint8_t* items, uint32_t count, uint8_t target)
-{
+static bool app_i2c_contains_u8(const uint8_t *items, uint32_t count, uint8_t target) {
     uint32_t i = 0;
     for (i = 0; i < count; ++i) {
         if (items[i] == target) {
@@ -312,14 +443,13 @@ static bool app_i2c_contains_u8(const uint8_t* items, uint32_t count, uint8_t ta
     return false;
 }
 
-static void app_i2c_scan_and_report(void)
-{
-    uint8_t found_ids[128] = { 0 };
+static void app_i2c_scan_and_report(void) {
+    uint8_t found_ids[128] = {0};
     uint32_t found_count = 0;
     uint8_t addr = 0;
 
     ESP_LOGI(g_log_tag, "i2c scan start: port=%d sda=%d scl=%d clk=%lu", (int)g_i2c_port,
-        (int)g_pin_i2c_sda, (int)g_pin_i2c_scl, (unsigned long)g_i2c_clk_hz);
+             (int)g_pin_i2c_sda, (int)g_pin_i2c_scl, (unsigned long)g_i2c_clk_hz);
 
     for (addr = 0x03; addr <= 0x77; ++addr) {
         if (app_i2c_probe_addr(addr)) {
@@ -334,46 +464,47 @@ static void app_i2c_scan_and_report(void)
     for (addr = 0; addr < (uint8_t)(sizeof(g_i2c_expected_ids)); ++addr) {
         const uint8_t expected = g_i2c_expected_ids[addr];
         const bool present = app_i2c_contains_u8(found_ids, found_count, expected);
-        ESP_LOGI(
-            g_log_tag, "i2c expected id=0x%02X => %s", expected, present ? "MATCH" : "MISSING");
+        ESP_LOGI(g_log_tag, "i2c expected id=0x%02X => %s", expected,
+                 present ? "MATCH" : "MISSING");
     }
 }
 
-static app_status_t app_init_led(void)
-{
+static app_status_t app_init_led(void) {
     led_strip_handle_t s = configure_led();
     if (s == NULL) {
-        return (
-            app_status_t) { .tag = APP_STATUS_GPIO_CONFIG_ERR, .value = { .esp_code = ESP_FAIL } };
+        return (app_status_t){.tag = APP_STATUS_GPIO_CONFIG_ERR, .value = {.esp_code = ESP_FAIL}};
     }
     esp_err_t rc = led_strip_clear(s);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_GPIO_CONFIG_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_GPIO_CONFIG_ERR, .value = {.esp_code = rc}};
     }
     rc = led_strip_refresh(s);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_GPIO_CONFIG_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_GPIO_CONFIG_ERR, .value = {.esp_code = rc}};
     }
-    return (app_status_t) { .tag = APP_STATUS_OK, .value = { .reserved = 0 } };
+    return (app_status_t){.tag = APP_STATUS_OK, .value = {.reserved = 0}};
 }
 
-static void app_timer_tick_led(void* arg)
-{
+static void app_timer_tick_led(void *arg) {
     (void)arg;
     g_led_state = !g_led_state;
     if (led_strip == NULL)
         return;
-    if (g_led_state) {
-        /* turn green */
-        led_strip_set_pixel(led_strip, 0, 0x00, 0x80, 0x00);
+    if (g_led_override) {
+        /* override color (steady) */
+        led_strip_set_pixel(led_strip, 0, g_led_r, g_led_g, g_led_b);
     } else {
-        led_strip_clear(led_strip);
+        if (g_led_state) {
+            /* turn green */
+            led_strip_set_pixel(led_strip, 0, 0x00, 0x80, 0x00);
+        } else {
+            led_strip_clear(led_strip);
+        }
     }
     led_strip_refresh(led_strip);
 }
 
-static app_status_t app_init_led_timer(void)
-{
+static app_status_t app_init_led_timer(void) {
     const esp_timer_create_args_t args = {
         .callback = &app_timer_tick_led,
         .arg = NULL,
@@ -384,19 +515,18 @@ static app_status_t app_init_led_timer(void)
 
     esp_err_t rc = esp_timer_create(&args, &g_led_timer);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_TIMER_CREATE_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_TIMER_CREATE_ERR, .value = {.esp_code = rc}};
     }
 
     rc = esp_timer_start_periodic(g_led_timer, g_led_period_us);
     if (rc != ESP_OK) {
-        return (app_status_t) { .tag = APP_STATUS_TIMER_START_ERR, .value = { .esp_code = rc } };
+        return (app_status_t){.tag = APP_STATUS_TIMER_START_ERR, .value = {.esp_code = rc}};
     }
 
-    return (app_status_t) { .tag = APP_STATUS_OK, .value = { .reserved = 0 } };
+    return (app_status_t){.tag = APP_STATUS_OK, .value = {.reserved = 0}};
 }
 
-void app_main(void)
-{
+void app_main(void) {
     const app_status_t led_rc = app_init_led();
     if (led_rc.tag != APP_STATUS_OK) {
         app_log_status("led_init", led_rc);
@@ -415,6 +545,40 @@ void app_main(void)
         return;
     }
 
+    /* Initialize NVS (required by WiFi). */
+    {
+        esp_err_t nvs_rc = nvs_flash_init();
+        if (nvs_rc == ESP_ERR_NVS_NO_FREE_PAGES || nvs_rc == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+            esp_err_t erase_rc = nvs_flash_erase();
+            if (erase_rc != ESP_OK) {
+                ESP_LOGW(g_log_tag, "nvs_flash_erase failed: %s", esp_err_to_name(erase_rc));
+            }
+            nvs_rc = nvs_flash_init();
+        }
+        if (nvs_rc != ESP_OK) {
+            ESP_LOGW(g_log_tag, "nvs_flash_init failed: %s", esp_err_to_name(nvs_rc));
+        }
+    }
+
+    /* Initialize WiFi station (optional). Edit WIFI_SSID/WIFI_PASS below. */
+#ifndef WIFI_SSID
+#define WIFI_SSID "OETELX"
+#define WIFI_PASS "1234567890"
+#endif
+    {
+        esp_err_t wrc = app_wifi_init_sta(WIFI_SSID, WIFI_PASS);
+        if (wrc != ESP_OK) {
+            ESP_LOGW(g_log_tag, "wifi init failed: %s", esp_err_to_name(wrc));
+        } else {
+            ESP_LOGI(g_log_tag, "wifi init started (STA)");
+            /* Register callback to start WireGuard when STA gets an IP */
+            wifi_register_got_ip_cb(wifi_got_ip_cb, NULL);
+            /* Register internal app event handler */
+            esp_event_handler_register(APP_EVENT, ESP_EVENT_ANY_ID, &app_event_handler, NULL);
+            //  esp_netif_dhcpc_stop(); /* stop DHCP client if you want to switch to static later */
+        }
+    }
+
     const app_status_t i2c_rc = app_init_i2c();
     if (i2c_rc.tag != APP_STATUS_OK) {
         app_log_status("i2c_init", i2c_rc);
@@ -423,8 +587,8 @@ void app_main(void)
 
     app_i2c_scan_and_report();
 
-    ssr_t ssr = { 0 };
-    th_t th = { 0 };
+    ssr_t ssr = {0}; /* AC-SSR */
+    th_t th = {0};   /* KMeterISO */
 
     ssr_result_t r = ssr_init(&ssr, g_i2c_bus, 0x50, 200);
     th_result_t th_r = th_init(&th, g_i2c_bus, 0x66, 200);
@@ -432,7 +596,7 @@ void app_main(void)
     if (r.tag != SSR_STATUS_OK) {
         if (r.tag == SSR_STATUS_I2C_ERR) {
             ESP_LOGE(g_log_tag, "ssr_init failed: tag=%d err=%s", (int)r.tag,
-                esp_err_to_name(r.value.esp_code));
+                     esp_err_to_name(r.value.esp_code));
         } else {
             ESP_LOGE(g_log_tag, "ssr_init failed: tag=%d", (int)r.tag);
         }
@@ -457,27 +621,30 @@ void app_main(void)
         }
         while (true) {
 
-            th_r = th_get_temp_c(&th); // get float using string read + conversion
+            int moet_koelen = 0;
 
-            if (th_r.tag == TH_STATUS_OK) {
-                ESP_LOGI(g_log_tag, "sth temp=%f C", th_r.value.temp_c);
-            } else if (th_r.tag == TH_STATUS_I2C_ERR) {
-                ESP_LOGW(
-                    g_log_tag, "sth_get_temp_c i2c err=%s", esp_err_to_name(th_r.value.esp_code));
-            } else if (th_r.tag == TH_STATUS_SENSOR_ERR) {
-                ESP_LOGW(
-                    g_log_tag, "sth_get_temp_c sensor error, status=0x%08X", th_r.value.status);
-            } else {
-                ESP_LOGW(g_log_tag, "sth_get_temp_c err tag=%d", (int)th_r.tag);
-            }
+            // th_r = th_get_temp_c(&th); // get float using string read + conversion
+
+            // if (th_r.tag == TH_STATUS_OK) {
+            //     ESP_LOGI(g_log_tag, "sth temp=%f C", th_r.value.temp_c);
+            // } else if (th_r.tag == TH_STATUS_I2C_ERR) {
+            //     ESP_LOGW(
+            //         g_log_tag, "sth_get_temp_c i2c err=%s",
+            //         esp_err_to_name(th_r.value.esp_code));
+            // } else if (th_r.tag == TH_STATUS_SENSOR_ERR) {
+            //     ESP_LOGW(
+            //         g_log_tag, "sth_get_temp_c sensor error, status=0x%08X", th_r.value.status);
+            // } else {
+            //     ESP_LOGW(g_log_tag, "sth_get_temp_c err tag=%d", (int)th_r.tag);
+            // }
 
             th_r = th_get_temp_c_float(&th); // get float using direct raw read
 
             if (th_r.tag == TH_STATUS_OK) {
                 ESP_LOGI(g_log_tag, "th tempf=%f C", th_r.value.temp_c);
             } else if (th_r.tag == TH_STATUS_I2C_ERR) {
-                ESP_LOGW(
-                    g_log_tag, "th_get_temp_c i2c err=%s", esp_err_to_name(th_r.value.esp_code));
+                ESP_LOGW(g_log_tag, "th_get_temp_c i2c err=%s",
+                         esp_err_to_name(th_r.value.esp_code));
             } else if (th_r.tag == TH_STATUS_SENSOR_ERR) {
                 ESP_LOGW(g_log_tag, "th_get_temp_c sensor error, status=0x%08X", th_r.value.status);
             } else {
@@ -492,7 +659,7 @@ void app_main(void)
             }
 
             vTaskDelay(pdMS_TO_TICKS(1000));
-
+#if 0
             r = ssr_set_active(&ssr, !r.value.active);
             if (r.tag != SSR_STATUS_OK) {
                 ESP_LOGW(g_log_tag, "ssr_set_active err tag=%d", (int)r.tag);
@@ -504,13 +671,19 @@ void app_main(void)
             } else {
                 ESP_LOGW(g_log_tag, "ssr_get_active err tag=%d", (int)r.tag);
             }
+#endif
+            //       vTaskDelay(pdMS_TO_TICKS(1000));
 
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            if (th_r.tag == TH_STATUS_OK) {
+                moet_koelen = th_r.value.temp_c > -20.0f; /* example threshold */
+            }
 
-            r = ssr_set_active(&ssr, !r.value.active);
+            r = ssr_set_active(&ssr, moet_koelen);
             if (r.tag != SSR_STATUS_OK) {
                 ESP_LOGW(g_log_tag, "ssr_set_active err tag=%d", (int)r.tag);
             }
+            /* Post temp alarm event for LED handling */
+            app_post_temp_alarm((bool)moet_koelen);
             ESP_LOGI(g_log_tag, "toggled ssr active state, sleeping 1s...");
         }
         ssr_deinit(&ssr);
