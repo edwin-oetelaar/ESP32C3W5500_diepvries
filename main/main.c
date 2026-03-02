@@ -19,17 +19,20 @@
 #include "esp_random.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "led_strip.h"
 #include "nvs_flash.h"
 #include "ssr_control.h"
 #include "th_sensor.h"
 #include "wg_obj.h"
 #include "wifi.h"
+#include "led.h"
+#include "i2c.h"
 
 static const char *g_log_tag = "app_main";
 
 /* Pas deze GPIO's aan op jouw S3 board routing naar W5500. */
-static const gpio_num_t g_pin_led = GPIO_NUM_21; /* WS2812 data pin */
 static const gpio_num_t g_pin_spi_miso = GPIO_NUM_12;
 static const gpio_num_t g_pin_spi_mosi = GPIO_NUM_11;
 static const gpio_num_t g_pin_spi_sclk = GPIO_NUM_13;
@@ -37,120 +40,11 @@ static const gpio_num_t g_pin_spi_cs = GPIO_NUM_14;
 static const gpio_num_t g_pin_eth_int = GPIO_NUM_10;
 static const gpio_num_t g_pin_eth_rst = GPIO_NUM_9;
 
-static const gpio_num_t g_pin_i2c_sda = GPIO_NUM_16;
-static const gpio_num_t g_pin_i2c_scl = GPIO_NUM_17;
-
-static const i2c_port_t g_i2c_port = I2C_NUM_0;
-static const uint32_t g_i2c_clk_hz = 400000;
-
-static const int g_i2c_probe_timeout_ms = 20;
-
-static const int g_led_period_us = 100 * 1000; /* LED blink period in microseconds (10Hz) */
 static esp_eth_handle_t g_eth_handle = NULL;
 
-static bool g_led_state = false;
-static esp_timer_handle_t g_led_timer = NULL;
-
-/* LED state updated from event handler */
-static bool g_led_override = false;
-static uint8_t g_led_r = 0, g_led_g = 0, g_led_b = 0;
-
-/* Application event base for internal pub-sub */
-ESP_EVENT_DEFINE_BASE(APP_EVENT);
-
-enum {
-    APP_EVENT_LED_SET_COLOR = 0,
-    APP_EVENT_TEMP_ALARM,
-    APP_EVENT_WG_STATUS,
-};
-
-typedef struct {
-    uint8_t r, g, b;
-} app_led_color_t;
-
-static void app_event_handler(void *handler_arg, esp_event_base_t base, int32_t id, void *event_data) {
-    (void)handler_arg;
-    if (base != APP_EVENT)
-        return;
-
-    if (id == APP_EVENT_LED_SET_COLOR && event_data) {
-        app_led_color_t *c = (app_led_color_t *)event_data;
-        g_led_r = c->r;
-        g_led_g = c->g;
-        g_led_b = c->b;
-        g_led_override = true;
-    } else if (id == APP_EVENT_TEMP_ALARM && event_data) {
-        /* event_data is bool pointer: true => alarm */
-        bool alarm = *(bool *)event_data;
-        if (alarm) {
-            /* red for temp alarm */
-            g_led_r = 0xFF; g_led_g = 0x00; g_led_b = 0x00;
-            g_led_override = true;
-        } else {
-            /* clear override to resume normal blink */
-            g_led_override = false;
-        }
-    } else if (id == APP_EVENT_WG_STATUS && event_data) {
-        /* event_data is int: 0=down,1=up */
-        int st = *(int *)event_data;
-        if (st) {
-            /* blue when WG up */
-            g_led_r = 0x00; g_led_g = 0x00; g_led_b = 0x80;
-            g_led_override = true;
-        } else {
-            /* red when WG down */
-            g_led_r = 0x80; g_led_g = 0x00; g_led_b = 0x00;
-            g_led_override = true;
-        }
-    }
-}
-
-static esp_err_t app_post_led_color(uint8_t r, uint8_t g, uint8_t b) {
-    app_led_color_t c = {.r = r, .g = g, .b = b};
-    return esp_event_post(APP_EVENT, APP_EVENT_LED_SET_COLOR, &c, sizeof(c), portMAX_DELAY);
-}
-
-static esp_err_t app_post_temp_alarm(bool alarm) {
-    return esp_event_post(APP_EVENT, APP_EVENT_TEMP_ALARM, &alarm, sizeof(alarm), portMAX_DELAY);
-}
-
-static esp_err_t app_post_wg_status(int status) {
-    return esp_event_post(APP_EVENT, APP_EVENT_WG_STATUS, &status, sizeof(status), portMAX_DELAY);
-}
-
-static i2c_master_bus_handle_t g_i2c_bus = NULL;
-
-static led_strip_handle_t led_strip = NULL;
 static wg_t *wg = NULL;
 
-led_strip_handle_t configure_led(void) {
-    /* LED strip common configuration */
-    led_strip_config_t strip_config = {
-        .strip_gpio_num = g_pin_led,
-        .max_leds = 1,
-        .led_model = LED_MODEL_WS2812,
-        .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,
-        .flags = {.invert_out = false},
-    };
-
-    /* RMT backend specific configuration */
-    led_strip_rmt_config_t rmt_config = {
-        .clk_src = RMT_CLK_SRC_DEFAULT,
-        .resolution_hz = 10 * 1000 * 1000, /* 10MHz */
-        .mem_block_symbols = 64,
-        .flags = {.with_dma = false},
-    };
-
-    /* Create the LED strip object and store it in the global handle */
-    led_strip_handle_t new_strip = NULL;
-    esp_err_t rc = led_strip_new_rmt_device(&strip_config, &rmt_config, &new_strip);
-    if (rc != ESP_OK) {
-        ESP_LOGE(g_log_tag, "led_strip_new_rmt_device failed: %s", esp_err_to_name(rc));
-        return NULL;
-    }
-    led_strip = new_strip;
-    return led_strip;
-}
+/* LED is handled by led.c module */
 
 typedef enum app_status_tag_e {
     APP_STATUS_OK = 0,
@@ -176,10 +70,7 @@ typedef struct app_status_s {
     } value;
 } app_status_t;
 
-static const uint8_t g_i2c_expected_ids[] = {
-    0x50, /* the AC-SSR m5stack*/
-    0x66, /* the KMeterISO m5stack */
-};
+/* expected i2c ids are internal to the i2c module now */
 
 /* Forward declaration of IP event handler used during netif setup */
 static void got_ip_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id,
@@ -368,19 +259,19 @@ static void maybe_start_wireguard(void) {
             peer.keepalive_seconds = 30;
             peer.port = 51820;
 
-            if (wg_add_peer(wg, &peer) != WG_OK) {
+                if (wg_add_peer(wg, &peer) != WG_OK) {
                 ESP_LOGW(g_log_tag, "wg_add_peer failed");
                 wg_destroy(&wg);
             } else if (wg_start(wg) != WG_OK) {
                 ESP_LOGW(g_log_tag, "wg_start failed");
-                app_post_wg_status(0);
+                led_post_wg_status(0);
                 wg_destroy(&wg);
             } else if (wg_connect_peer(wg, WG_PEER_B64) != WG_OK) {
                 ESP_LOGW(g_log_tag, "wg_connect_peer failed");
                 /* keep wg object around in case caller wants to inspect */
-                app_post_wg_status(0);
+                led_post_wg_status(0);
             } else {
-                app_post_wg_status(1);
+                led_post_wg_status(1);
                 ESP_LOGI(g_log_tag, "wireguard init via object API succeeded");
             }
         }
@@ -394,6 +285,25 @@ static void wifi_got_ip_cb(void *arg) {
     maybe_start_wireguard();
 }
 
+/* Periodic task that prints FreeRTOS run-time stats. Requires enabling
+ * CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS and CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
+ * in menuconfig. */
+static void task_print_stats(void *arg) {
+    (void)arg;
+    char *buf = malloc(2048);
+    // char buf[2048];
+    for (;;) {
+#if CONFIG_FREERTOS_USE_STATS_FORMATTING_FUNCTIONS
+        vTaskGetRunTimeStats(buf);
+        ESP_LOGI(g_log_tag, "Run time stats:\n%s", buf);
+#else
+        ESP_LOGW(g_log_tag, "Run time stats not enabled in menuconfig");
+#endif
+        vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+    free(buf);
+}
+
 static void app_log_status(const char *label, app_status_t status) {
     if (status.tag == APP_STATUS_OK) {
         ESP_LOGI(g_log_tag, "%s: ok", label);
@@ -404,144 +314,18 @@ static void app_log_status(const char *label, app_status_t status) {
              esp_err_to_name(status.value.esp_code));
 }
 
-static app_status_t app_init_i2c(void) {
-    const i2c_master_bus_config_t cfg = {
-        .i2c_port = g_i2c_port,
-        .sda_io_num = g_pin_i2c_sda,
-        .scl_io_num = g_pin_i2c_scl,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .intr_priority = 0,
-        .trans_queue_depth = 0,
-        .flags.enable_internal_pullup = true,
-    };
-
-    const esp_err_t rc = i2c_new_master_bus(&cfg, &g_i2c_bus);
-    if (rc != ESP_OK) {
-        return (app_status_t){.tag = APP_STATUS_I2C_BUS_NEW_ERR, .value = {.esp_code = rc}};
-    }
-
-    return (app_status_t){.tag = APP_STATUS_OK, .value = {.reserved = 0}};
-}
-
-static bool app_i2c_probe_addr(uint8_t addr) {
-    if (g_i2c_bus == NULL) {
-        return false;
-    }
-
-    const esp_err_t rc = i2c_master_probe(g_i2c_bus, addr, g_i2c_probe_timeout_ms);
-    return rc == ESP_OK;
-}
-
-static bool app_i2c_contains_u8(const uint8_t *items, uint32_t count, uint8_t target) {
-    uint32_t i = 0;
-    for (i = 0; i < count; ++i) {
-        if (items[i] == target) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static void app_i2c_scan_and_report(void) {
-    uint8_t found_ids[128] = {0};
-    uint32_t found_count = 0;
-    uint8_t addr = 0;
-
-    ESP_LOGI(g_log_tag, "i2c scan start: port=%d sda=%d scl=%d clk=%lu", (int)g_i2c_port,
-             (int)g_pin_i2c_sda, (int)g_pin_i2c_scl, (unsigned long)g_i2c_clk_hz);
-
-    for (addr = 0x03; addr <= 0x77; ++addr) {
-        if (app_i2c_probe_addr(addr)) {
-            found_ids[found_count] = addr;
-            found_count += 1;
-            ESP_LOGI(g_log_tag, "i2c found id=0x%02X", addr);
-        }
-    }
-
-    ESP_LOGI(g_log_tag, "i2c scan done: %u device(s)", (unsigned)found_count);
-
-    for (addr = 0; addr < (uint8_t)(sizeof(g_i2c_expected_ids)); ++addr) {
-        const uint8_t expected = g_i2c_expected_ids[addr];
-        const bool present = app_i2c_contains_u8(found_ids, found_count, expected);
-        ESP_LOGI(g_log_tag, "i2c expected id=0x%02X => %s", expected,
-                 present ? "MATCH" : "MISSING");
-    }
-}
-
-static app_status_t app_init_led(void) {
-    led_strip_handle_t s = configure_led();
-    if (s == NULL) {
-        return (app_status_t){.tag = APP_STATUS_GPIO_CONFIG_ERR, .value = {.esp_code = ESP_FAIL}};
-    }
-    esp_err_t rc = led_strip_clear(s);
-    if (rc != ESP_OK) {
-        return (app_status_t){.tag = APP_STATUS_GPIO_CONFIG_ERR, .value = {.esp_code = rc}};
-    }
-    rc = led_strip_refresh(s);
-    if (rc != ESP_OK) {
-        return (app_status_t){.tag = APP_STATUS_GPIO_CONFIG_ERR, .value = {.esp_code = rc}};
-    }
-    return (app_status_t){.tag = APP_STATUS_OK, .value = {.reserved = 0}};
-}
-
-static void app_timer_tick_led(void *arg) {
-    (void)arg;
-    g_led_state = !g_led_state;
-    if (led_strip == NULL)
-        return;
-    if (g_led_override) {
-        /* override color (steady) */
-        led_strip_set_pixel(led_strip, 0, g_led_r, g_led_g, g_led_b);
-    } else {
-        if (g_led_state) {
-            /* turn green */
-            led_strip_set_pixel(led_strip, 0, 0x00, 0x80, 0x00);
-        } else {
-            led_strip_clear(led_strip);
-        }
-    }
-    led_strip_refresh(led_strip);
-}
-
-static app_status_t app_init_led_timer(void) {
-    const esp_timer_create_args_t args = {
-        .callback = &app_timer_tick_led,
-        .arg = NULL,
-        .dispatch_method = ESP_TIMER_TASK,
-        .name = "led_blink",
-        .skip_unhandled_events = true,
-    };
-
-    esp_err_t rc = esp_timer_create(&args, &g_led_timer);
-    if (rc != ESP_OK) {
-        return (app_status_t){.tag = APP_STATUS_TIMER_CREATE_ERR, .value = {.esp_code = rc}};
-    }
-
-    rc = esp_timer_start_periodic(g_led_timer, g_led_period_us);
-    if (rc != ESP_OK) {
-        return (app_status_t){.tag = APP_STATUS_TIMER_START_ERR, .value = {.esp_code = rc}};
-    }
-
-    return (app_status_t){.tag = APP_STATUS_OK, .value = {.reserved = 0}};
-}
+/* LED timer/handling moved to led.c */
 
 void app_main(void) {
-    const app_status_t led_rc = app_init_led();
-    if (led_rc.tag != APP_STATUS_OK) {
-        app_log_status("led_init", led_rc);
-        return;
-    }
-
-    const app_status_t timer_rc = app_init_led_timer();
-    if (timer_rc.tag != APP_STATUS_OK) {
-        app_log_status("timer_init", timer_rc);
-        return;
-    }
-
     const app_status_t eth_rc = app_init_eth_w5500();
     if (eth_rc.tag != APP_STATUS_OK) {
         app_log_status("eth_w5500_init", eth_rc);
+        return;
+    }
+
+    /* Initialize LED module (timer + handler) after event loop exists */
+    if (led_init() != ESP_OK) {
+        ESP_LOGW(g_log_tag, "led_init failed");
         return;
     }
 
@@ -573,25 +357,25 @@ void app_main(void) {
             ESP_LOGI(g_log_tag, "wifi init started (STA)");
             /* Register callback to start WireGuard when STA gets an IP */
             wifi_register_got_ip_cb(wifi_got_ip_cb, NULL);
-            /* Register internal app event handler */
-            esp_event_handler_register(APP_EVENT, ESP_EVENT_ANY_ID, &app_event_handler, NULL);
             //  esp_netif_dhcpc_stop(); /* stop DHCP client if you want to switch to static later */
         }
     }
-
-    const app_status_t i2c_rc = app_init_i2c();
-    if (i2c_rc.tag != APP_STATUS_OK) {
-        app_log_status("i2c_init", i2c_rc);
+    /* Initialize I2C via module */
+    if (i2c_init() != ESP_OK) {
+        ESP_LOGW(g_log_tag, "i2c_init failed");
         return;
     }
+    i2c_scan_and_report();
 
-    app_i2c_scan_and_report();
+    /* Start periodic FreeRTOS stats printer (non-blocking) */
+    xTaskCreatePinnedToCore(task_print_stats, "task_stats", 4096, NULL,
+                            tskIDLE_PRIORITY + 1, NULL, tskNO_AFFINITY);
 
     ssr_t ssr = {0}; /* AC-SSR */
     th_t th = {0};   /* KMeterISO */
 
-    ssr_result_t r = ssr_init(&ssr, g_i2c_bus, 0x50, 200);
-    th_result_t th_r = th_init(&th, g_i2c_bus, 0x66, 200);
+    ssr_result_t r = ssr_init(&ssr, i2c_get_bus(), 0x50, 200);
+    th_result_t th_r = th_init(&th, i2c_get_bus(), 0x66, 200);
 
     if (r.tag != SSR_STATUS_OK) {
         if (r.tag == SSR_STATUS_I2C_ERR) {
@@ -683,11 +467,11 @@ void app_main(void) {
                 ESP_LOGW(g_log_tag, "ssr_set_active err tag=%d", (int)r.tag);
             }
             /* Post temp alarm event for LED handling */
-            app_post_temp_alarm((bool)moet_koelen);
+            led_post_temp_alarm((bool)moet_koelen);
             ESP_LOGI(g_log_tag, "toggled ssr active state, sleeping 1s...");
         }
         ssr_deinit(&ssr);
     }
 
-    ESP_LOGI(g_log_tag, "running: led timer=%lld us + i2c scan done + w5500 up", g_led_period_us);
+    ESP_LOGI(g_log_tag, "running: i2c scan done + w5500 up");
 }

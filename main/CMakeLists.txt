@@ -2,6 +2,8 @@ idf_component_register(SRCS  "main.c"
         "ssr_control.c"
         "th_sensor.c"
         "wifi.c"
+        "led.c"
+        "i2c.c"
         "wg_obj.c"
         PRIV_REQUIRES
         "mbedtls"
