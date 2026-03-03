@@ -5,6 +5,7 @@ idf_component_register(SRCS  "main.c"
         "led.c"
         "i2c.c"
         "wg_obj.c"
+        "eth_w5500.c"
         PRIV_REQUIRES
         "mbedtls"
         "nvs_flash"
